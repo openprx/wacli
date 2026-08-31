@@ -86,6 +86,29 @@ func TestSendDelegateRequestPreservesEphemeralInJSON(t *testing.T) {
 	}
 }
 
+func TestSendDelegateRequestPreservesAllowSelfSendInJSON(t *testing.T) {
+	raw, err := json.Marshal(sendDelegateRequest{
+		Version:       sendDelegateVersion,
+		Kind:          "text",
+		Message:       "hello self",
+		AllowSelfSend: true,
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"allow_self_send":true`) {
+		t.Fatalf("encoded request missing allow-self-send flag: %s", raw)
+	}
+
+	var got sendDelegateRequest
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !got.AllowSelfSend {
+		t.Fatal("AllowSelfSend = false, want true")
+	}
+}
+
 func TestSendDelegateRequestPreservesReplyInJSON(t *testing.T) {
 	raw, err := json.Marshal(sendDelegateRequest{
 		Version:       sendDelegateVersion,

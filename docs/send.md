@@ -30,7 +30,7 @@ wacli polls list [--chat RECIPIENT] [--limit N] [--json]
 - If a name matches multiple recipients, interactive terminals prompt.
 - In scripts, use `--pick N` to choose a displayed match.
 - Phone numbers may use common formatting such as `+1 (234) 567-8900`.
-- `send text` rejects the linked account's own phone-number or LID target. WhatsApp may acknowledge these self-DMs without delivering them to Message Yourself, so wacli returns an explicit error instead of `sent: true`.
+- `send text` rejects the linked account's own phone-number or LID target by default. WhatsApp may acknowledge these self-DMs without delivering them to Message Yourself, so wacli returns an explicit error instead of `sent: true`. Experimental integrations may opt in with `--allow-self-send`; callers must verify delivery and prevent their own outbound message IDs from re-entering an automation loop.
 
 ## Replies and reactions
 

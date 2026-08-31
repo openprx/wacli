@@ -179,6 +179,35 @@ func TestSendTextToOwnPNRejectsWithoutRegistrationCanonicalization(t *testing.T)
 	}
 }
 
+func TestSendTextToOwnPNAllowsExplicitOptIn(t *testing.T) {
+	pn := types.NewJID("15551234567", types.DefaultUserServer)
+	lid := types.NewJID("999123456789", types.HiddenUserServer)
+	sender := &recordingTextSender{linkedJID: pn.String(), linkedLID: lid}
+
+	id, err := sendTextMessageWithSenderOptions(
+		context.Background(),
+		sender,
+		openSendTestDB(t),
+		lid,
+		"self-test",
+		"",
+		"",
+		nil,
+		nil,
+		textEphemeralOptions{},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("sendTextMessageWithSenderOptions: %v", err)
+	}
+	if id == "" {
+		t.Fatal("self-send must return a message id")
+	}
+	if sender.textRecipient != lid || sender.textCalls != 1 {
+		t.Fatalf("self-send target=%s calls=%d, want target=%s calls=1", sender.textRecipient, sender.textCalls, lid)
+	}
+}
+
 func TestPersistOutboundTextCanonicalizesSelfLIDToPN(t *testing.T) {
 	db := openSendTestDB(t)
 	pn := types.NewJID("15551234567", types.DefaultUserServer)
