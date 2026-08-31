@@ -6,11 +6,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openclaw/wacli/internal/out"
 	"golang.org/x/term"
 )
 
 func isTTY() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+func isInteractive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stderr.Fd()))
 }
 
 func parseTime(s string) (time.Time, error) {
@@ -27,14 +32,33 @@ func parseTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unsupported time format %q (use RFC3339 or YYYY-MM-DD)", s)
 }
 
+func sanitize(s string) string {
+	return out.SanitizeHuman(s)
+}
+
+func sanitizeBody(s string) string {
+	return out.SanitizeBody(s)
+}
+
 func truncate(s string, max int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.TrimSpace(s)
-	if max <= 0 || len(s) <= max {
+	s = sanitize(s)
+	if max <= 0 {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
 	if max <= 1 {
-		return s[:max]
+		return string(runes[:max])
 	}
-	return s[:max-1] + "…"
+	return string(runes[:max-1]) + "…"
+}
+
+func fullTableOutput(forceFull bool) bool {
+	return fullTableOutputWithTTY(forceFull, isTTY())
+}
+
+func fullTableOutputWithTTY(forceFull, tty bool) bool {
+	return forceFull || !tty
 }

@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/openclaw/wacli/internal/out"
 	"github.com/spf13/cobra"
-	"github.com/steipete/wacli/internal/out"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -82,6 +82,9 @@ func newGroupsInviteLinkRevokeCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(jidStr) == "" {
 				return fmt.Errorf("--jid is required")
 			}
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
@@ -125,6 +128,9 @@ func newGroupsJoinCmd(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(code) == "" {
 				return fmt.Errorf("--code is required")
 			}
+			if err := flags.requireWritable(); err != nil {
+				return err
+			}
 			ctx, cancel := withTimeout(context.Background(), flags)
 			defer cancel()
 
@@ -145,7 +151,7 @@ func newGroupsJoinCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			if info, err := a.WA().GetGroupInfo(ctx, jid); err == nil && info != nil {
-				_ = persistGroupInfo(a.DB(), info)
+				_ = persistGroupInfo(ctx, a.DB(), a.WA(), info)
 			}
 			if flags.asJSON {
 				return out.WriteJSON(os.Stdout, map[string]any{"jid": jid.String(), "joined": true})

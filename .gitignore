@@ -42,3 +42,7 @@ go.work.sum
 
 # pnpm build output
 /dist/
+.pnpm-store/
+
+# Node dependencies
+node_modules/

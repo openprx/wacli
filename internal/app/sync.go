@@ -2,17 +2,29 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/steipete/wacli/internal/store"
-	"github.com/steipete/wacli/internal/wa"
+	"github.com/openclaw/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/wa"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
 )
+
+const maxAuthConnectAttempts = 3
+
+// MaxStaleThreshold returns the exclusive upper bound for keepalive-failure thresholds.
+// It reserves one maximum keepalive probe interval plus response deadline before
+// whatsmeow's own failed-keepalive auto-reconnect window.
+func MaxStaleThreshold() time.Duration {
+	return whatsmeow.KeepAliveMaxFailTime - whatsmeow.KeepAliveIntervalMax - whatsmeow.KeepAliveResponseDeadline
+}
 
 type SyncMode string
 
@@ -22,16 +34,51 @@ const (
 	SyncModeFollow    SyncMode = "follow"
 )
 
+type SyncPresenceMode string
+
+const (
+	SyncPresenceModeNormal SyncPresenceMode = "normal"
+	SyncPresenceModeQuiet  SyncPresenceMode = "quiet"
+)
+
+func ParseSyncPresenceMode(value string) (SyncPresenceMode, error) {
+	switch SyncPresenceMode(strings.TrimSpace(value)) {
+	case "", SyncPresenceModeNormal:
+		return SyncPresenceModeNormal, nil
+	case SyncPresenceModeQuiet:
+		return SyncPresenceModeQuiet, nil
+	default:
+		return "", fmt.Errorf("--presence-mode must be one of: normal, quiet")
+	}
+}
+
+func (m SyncPresenceMode) SendsAvailablePresence() bool {
+	return m != SyncPresenceModeQuiet
+}
+
 type SyncOptions struct {
-	Mode            SyncMode
-	AllowQR         bool
-	OnQRCode        func(string)
-	AfterConnect    func(context.Context) error
-	DownloadMedia   bool
-	RefreshContacts bool
-	RefreshGroups   bool
-	IdleExit        time.Duration // only used for bootstrap/once
-	Verbosity       int           // future
+	Mode                SyncMode
+	PresenceMode        SyncPresenceMode
+	AllowQR             bool
+	OnQRCode            func(string)
+	PairPhoneNumber     string
+	OnPairCode          func(string)
+	AfterConnect        func(context.Context) error
+	DownloadMedia       bool
+	RefreshContacts     bool
+	RefreshGroups       bool
+	RefreshChannels     bool
+	IdleExit            time.Duration // only used for bootstrap/once
+	MaxReconnect        time.Duration // max time to attempt reconnection before giving up (0 = unlimited)
+	StaleThreshold      time.Duration // force reconnect when keepalive failures last this long in follow mode (0 = disabled)
+	MaxMessages         int64         // 0 = unlimited
+	MaxDBSizeBytes      int64         // 0 = unlimited
+	WarnNoLimits        bool
+	WebhookURL          string
+	WebhookSecret       string
+	WebhookAllowPrivate bool
+	WebhookEvents       SyncWebhookEventSet // nil = messages only
+	Verbosity           int                 // future
 }
 
 type SyncResult struct {
@@ -39,178 +86,305 @@ type SyncResult struct {
 }
 
 func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
+	status := a.beginSyncStatus()
+	defer a.endSyncStatus(status)
+
 	if opts.Mode == "" {
 		opts.Mode = SyncModeFollow
+	}
+	if opts.PresenceMode == "" {
+		opts.PresenceMode = SyncPresenceModeNormal
 	}
 	if (opts.Mode == SyncModeBootstrap || opts.Mode == SyncModeOnce) && opts.IdleExit <= 0 {
 		opts.IdleExit = 30 * time.Second
 	}
+	if maxStaleThreshold := MaxStaleThreshold(); opts.StaleThreshold >= maxStaleThreshold {
+		return SyncResult{}, fmt.Errorf("stale threshold %s must be less than upstream auto-reconnect threshold %s", opts.StaleThreshold, maxStaleThreshold)
+	}
+	if opts.WarnNoLimits && opts.MaxMessages <= 0 && opts.MaxDBSizeBytes <= 0 {
+		a.emitWarning(
+			"sync_storage_uncapped",
+			"warning: sync storage is uncapped; use --max-messages or --max-db-size to bound local history growth",
+			nil,
+		)
+	}
+	if err := a.checkSyncStorageLimits(opts); err != nil {
+		return SyncResult{}, err
+	}
+
+	syncCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	limits := &syncStorageLimits{app: a, opts: opts, cancel: cancel}
 
 	if err := a.OpenWA(); err != nil {
 		return SyncResult{}, err
 	}
+	if opts.Mode == SyncModeFollow && opts.StaleThreshold > 0 {
+		restoreAutoReconnect, ok := a.wa.SetAutoReconnect(false)
+		if !ok {
+			return SyncResult{}, fmt.Errorf("could not configure stale-threshold reconnect on an already-connected WhatsApp client")
+		}
+		defer func() {
+			if !a.wa.IsConnected() {
+				a.wa.SetAutoReconnect(restoreAutoReconnect)
+			}
+		}()
+	}
+	a.wa.SetManualHistorySyncDownload(true)
+	defer a.wa.SetManualHistorySyncDownload(false)
 
 	var messagesStored atomic.Int64
 	lastEvent := atomic.Int64{}
-	lastEvent.Store(time.Now().UTC().UnixNano())
+	connectionEpoch := atomic.Int64{}
+	now := nowUTC().UnixNano()
+	lastEvent.Store(now)
 
 	disconnected := make(chan struct{}, 1)
+	loggedOut := make(chan struct{}, 1)
+	staleReconnect := make(chan staleReconnectRequest, 1)
 
-	var stopMedia func()
-	var mediaJobs chan mediaJob
+	var waitMedia func(context.Context) bool
+	var mediaQ *mediaQueue
 	enqueueMedia := func(chatJID, msgID string) {}
 	if opts.DownloadMedia {
-		mediaJobs = make(chan mediaJob, 512)
-		enqueueMedia = func(chatJID, msgID string) {
-			if strings.TrimSpace(chatJID) == "" || strings.TrimSpace(msgID) == "" {
-				return
-			}
-			select {
-			case mediaJobs <- mediaJob{chatJID: chatJID, msgID: msgID}:
-			default:
-				// Avoid blocking the event handler.
-				go func() {
-					select {
-					case mediaJobs <- mediaJob{chatJID: chatJID, msgID: msgID}:
-					case <-ctx.Done():
-					}
-				}()
-			}
-		}
-	}
-
-	handlerID := a.wa.AddEventHandler(func(evt interface{}) {
-		lastEvent.Store(time.Now().UTC().UnixNano())
-
-		switch v := evt.(type) {
-		case *events.Message:
-			pm := wa.ParseLiveMessage(v)
-			if pm.ReactionToID != "" && pm.ReactionEmoji == "" && v.Message != nil && v.Message.GetEncReactionMessage() != nil {
-				if reaction, err := a.wa.DecryptReaction(ctx, v); err == nil && reaction != nil {
-					pm.ReactionEmoji = reaction.GetText()
-					if pm.ReactionToID == "" {
-						if key := reaction.GetKey(); key != nil {
-							pm.ReactionToID = key.GetID()
-						}
-					}
-				}
-			}
-			if err := a.storeParsedMessage(ctx, pm); err == nil {
-				messagesStored.Add(1)
-			}
-			if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
-				enqueueMedia(pm.Chat.String(), pm.ID)
-			}
-			if messagesStored.Load()%25 == 0 {
-				fmt.Fprintf(os.Stderr, "\rSynced %d messages...", messagesStored.Load())
-			}
-		case *events.HistorySync:
-			fmt.Fprintf(os.Stderr, "\nProcessing history sync (%d conversations)...\n", len(v.Data.Conversations))
-			for _, conv := range v.Data.Conversations {
-				lastEvent.Store(time.Now().UTC().UnixNano())
-				chatID := strings.TrimSpace(conv.GetID())
-				if chatID == "" {
-					continue
-				}
-				for _, m := range conv.Messages {
-					lastEvent.Store(time.Now().UTC().UnixNano())
-					if m.Message == nil {
-						continue
-					}
-					pm := wa.ParseHistoryMessage(chatID, m.Message)
-					if pm.ID == "" || pm.Chat.IsEmpty() {
-						continue
-					}
-					if err := a.storeParsedMessage(ctx, pm); err == nil {
-						messagesStored.Add(1)
-					}
-					if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
-						enqueueMedia(pm.Chat.String(), pm.ID)
-					}
-				}
-			}
-			fmt.Fprintf(os.Stderr, "\rSynced %d messages...", messagesStored.Load())
-		case *events.Connected:
-			fmt.Fprintln(os.Stderr, "\nConnected.")
-		case *events.Disconnected:
-			fmt.Fprintln(os.Stderr, "\nDisconnected.")
-			select {
-			case disconnected <- struct{}{}:
-			default:
-			}
-		}
-	})
-	defer a.wa.RemoveEventHandler(handlerID)
-
-	if err := a.Connect(ctx, opts.AllowQR, opts.OnQRCode); err != nil {
-		return SyncResult{}, err
+		mediaQ = newMediaQueue(512)
+		enqueueMedia = newMediaEnqueuer(syncCtx, mediaQ)
 	}
 
 	if opts.DownloadMedia {
-		var err error
-		stopMedia, err = a.runMediaWorkers(ctx, mediaJobs, 4)
+		wait, cancelMedia, err := a.runMediaWorkers(syncCtx, mediaQ, 4)
 		if err != nil {
 			return SyncResult{}, err
 		}
-		defer stopMedia()
+		defer func() {
+			cancelMedia()
+			wait()
+		}()
+		waitMedia = mediaQ.waitIdle
 	}
+
+	var stopWebhook func()
+	var webhookJobs chan syncWebhookEvent
+	enqueueWebhook := func(syncWebhookEvent) {}
+	if syncWebhookEnabled(opts) {
+		webhookJobs = make(chan syncWebhookEvent, 512)
+		enqueueWebhook = a.newSyncWebhookEnqueuer(syncCtx, webhookJobs)
+		stopWebhook = a.runSyncWebhookWorker(syncCtx, opts, webhookJobs)
+		defer stopWebhook()
+	}
+
+	ps := &syncPresence{}
+	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, loggedOut, staleReconnect, enqueueMedia, enqueueWebhook, limits, ps, mediaQ)
+	defer a.wa.RemoveEventHandler(handlerID)
+
+	connectionEpoch.Store(nowUTC().UnixNano())
+	if err := a.connectForSync(syncCtx, opts); err != nil {
+		return SyncResult{}, err
+	}
+	// Ensure unavailable presence is sent on ALL post-connect exits
+	// (success, error, storage limit, reconnect failure), not just the
+	// success path. The websocket stays alive via DetachSocket, so the
+	// send can complete even after the sync context is cancelled.
+	defer func() {
+		ps.mu.Lock()
+		ps.cleanupStarted = true
+		ps.mu.Unlock()
+		a.wa.RemoveEventHandler(handlerID)
+		a.sendPresenceBounded(types.PresenceUnavailable)
+	}()
+	now = nowUTC().UnixNano()
+	lastEvent.Store(now)
+	if err := a.migrateHistoricalLIDs(syncCtx); err != nil {
+		return SyncResult{MessagesStored: messagesStored.Load()}, err
+	}
+	a.syncAppStateDeltas(syncCtx)
 
 	// Optional: bootstrap imports (helps contacts/groups management without waiting for events).
 	if opts.RefreshContacts {
-		_ = a.refreshContacts(ctx)
+		if err := a.refreshContacts(syncCtx); err != nil {
+			a.emitWarning(
+				"refresh_contacts_failed",
+				fmt.Sprintf("warning: failed to refresh contacts: %v", err),
+				map[string]any{"error": err.Error()},
+			)
+		}
 	}
 	if opts.RefreshGroups {
-		_ = a.refreshGroups(ctx)
+		if err := a.refreshGroups(syncCtx); err != nil {
+			a.emitWarning(
+				"refresh_groups_failed",
+				fmt.Sprintf("warning: failed to refresh groups: %v", err),
+				map[string]any{"error": err.Error()},
+			)
+		}
+	}
+	if opts.RefreshChannels {
+		if err := a.refreshNewsletters(syncCtx); err != nil {
+			a.emitWarning(
+				"refresh_channels_failed",
+				fmt.Sprintf("warning: failed to refresh channels: %v", err),
+				map[string]any{"error": err.Error()},
+			)
+		}
 	}
 	if opts.AfterConnect != nil {
-		if err := opts.AfterConnect(ctx); err != nil {
+		if err := opts.AfterConnect(syncCtx); err != nil {
 			return SyncResult{MessagesStored: messagesStored.Load()}, err
 		}
 	}
 
+	var err error
 	if opts.Mode == SyncModeFollow {
-		for {
-			select {
-			case <-ctx.Done():
-				fmt.Fprintln(os.Stderr, "\nStopping sync.")
-				return SyncResult{MessagesStored: messagesStored.Load()}, nil
-			case <-disconnected:
-				fmt.Fprintln(os.Stderr, "Reconnecting...")
-				if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
-					return SyncResult{MessagesStored: messagesStored.Load()}, err
-				}
-			}
-		}
+		_, err = a.runSyncFollow(syncCtx, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &connectionEpoch, disconnected, loggedOut, staleReconnect)
+	} else {
+		_, err = a.runSyncUntilIdle(syncCtx, opts.IdleExit, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &lastEvent, disconnected, loggedOut)
 	}
+	limitErr := limits.Err()
+	// Successful one-shot modes must finish queued downloads before cleanup
+	// cancels the worker context. Follow mode keeps the queue open; error,
+	// cancellation, and storage-limit exits retain immediate cancellation.
+	if waitMedia != nil && opts.Mode != SyncModeFollow && err == nil && limitErr == nil && syncCtx.Err() == nil {
+		waitMedia(syncCtx)
+		limitErr = limits.Err()
+	}
+	if limitErr != nil {
+		return SyncResult{MessagesStored: messagesStored.Load()}, limitErr
+	}
+	if err != nil {
+		return SyncResult{MessagesStored: messagesStored.Load()}, err
+	}
+	return SyncResult{MessagesStored: messagesStored.Load()}, nil
+}
 
-	// Bootstrap/once: exit after idle.
-	poll := 250 * time.Millisecond
-	if opts.IdleExit >= 2*time.Second {
-		poll = 1 * time.Second
-	}
-	ticker := time.NewTicker(poll)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "\nStopping sync.")
-			return SyncResult{MessagesStored: messagesStored.Load()}, nil
-		case <-disconnected:
-			fmt.Fprintln(os.Stderr, "Reconnecting...")
-			if err := a.wa.ReconnectWithBackoff(ctx, 2*time.Second, 30*time.Second); err != nil {
-				return SyncResult{MessagesStored: messagesStored.Load()}, err
-			}
-		case <-ticker.C:
-			last := time.Unix(0, lastEvent.Load())
-			if time.Since(last) >= opts.IdleExit {
-				fmt.Fprintf(os.Stderr, "\nIdle for %s, exiting.\n", opts.IdleExit)
-				return SyncResult{MessagesStored: messagesStored.Load()}, nil
-			}
+func (a *App) syncAppStateDeltas(ctx context.Context) {
+	for _, name := range []appstate.WAPatchName{appstate.WAPatchRegularHigh, appstate.WAPatchRegularLow, appstate.WAPatchRegular} {
+		fullSync := name == appstate.WAPatchRegular
+		if err := a.wa.FetchAppState(ctx, string(name), fullSync, false); err != nil {
+			a.emitWarning(
+				"app_state_sync_failed",
+				fmt.Sprintf("warning: failed to sync WhatsApp app state %s: %v", name, err),
+				map[string]any{"name": string(name), "error": err.Error()},
+			)
 		}
 	}
 }
 
+func (a *App) connectForSync(ctx context.Context, opts SyncOptions) error {
+	connectOpts := wa.ConnectOptions{
+		AllowQR:                          opts.AllowQR,
+		OnQRCode:                         opts.OnQRCode,
+		PairPhoneNumber:                  opts.PairPhoneNumber,
+		OnPairCode:                       opts.OnPairCode,
+		SuppressInitialAvailablePresence: !opts.PresenceMode.SendsAvailablePresence(),
+		// Only detach for already-authenticated sync, not for auth
+		// bootstrap (AllowQR / phone pairing) where caller
+		// cancellation must bound the QR/pairing flow.
+		DetachSocket: opts.AllowQR == false && opts.PairPhoneNumber == "",
+	}
+
+	attempts := 1
+	if opts.AllowQR || opts.PairPhoneNumber != "" {
+		attempts = maxAuthConnectAttempts
+	}
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err := a.wa.Connect(ctx, connectOpts)
+		if err == nil {
+			return nil
+		}
+		if attempt == attempts || ctx.Err() != nil || !isRetryableAuthConnectError(err) {
+			return err
+		}
+		a.emitWarning(
+			"auth_connect_retry",
+			fmt.Sprintf("warning: auth connection dropped before pairing completed; retrying (%d/%d)", attempt+1, attempts),
+			map[string]any{"attempt": attempt + 1, "attempts": attempts},
+		)
+		select {
+		case <-time.After(authConnectRetryDelay(attempt)):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func authConnectRetryDelay(attempt int) time.Duration {
+	return time.Duration(attempt) * 500 * time.Millisecond
+}
+
+func isRetryableAuthConnectError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"qr code timed out",
+		"qr channel closed",
+		"websocket",
+		"failed to read frame header",
+		"connection reset",
+		"broken pipe",
+		"i/o timeout",
+		"eof",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) checkSyncStorageLimits(opts SyncOptions) error {
+	if opts.MaxMessages > 0 {
+		count, err := a.db.CountMessages()
+		if err != nil {
+			return fmt.Errorf("check message limit: %w", err)
+		}
+		if count >= opts.MaxMessages {
+			return syncStorageLimitError("message", count, opts.MaxMessages)
+		}
+	}
+	if opts.MaxDBSizeBytes > 0 {
+		size, err := a.dbDiskSize()
+		if err != nil {
+			return fmt.Errorf("check database size limit: %w", err)
+		}
+		if size >= opts.MaxDBSizeBytes {
+			return syncStorageLimitError("database size", size, opts.MaxDBSizeBytes)
+		}
+	}
+	return nil
+}
+
+func (a *App) dbDiskSize() (int64, error) {
+	var total int64
+	for _, path := range []string{
+		filepath.Join(a.opts.StoreDir, "wacli.db"),
+		filepath.Join(a.opts.StoreDir, "wacli.db-wal"),
+		filepath.Join(a.opts.StoreDir, "wacli.db-shm"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, err
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+	}
+	return total, nil
+}
+
+func syncStorageLimitError(kind string, got, limit int64) error {
+	return fmt.Errorf("sync storage limit reached: %s is %d, limit is %d", kind, got, limit)
+}
+
 func chatKind(chat types.JID) string {
+	if chat.Server == types.NewsletterServer {
+		return "newsletter"
+	}
 	if chat.Server == types.GroupServer {
 		return "group"
 	}
@@ -224,18 +398,22 @@ func chatKind(chat types.JID) string {
 }
 
 func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
-	chatJID := pm.Chat.String()
+	pm.Chat = a.canonicalStoreJID(ctx, pm.Chat)
+	chatJID := canonicalJIDString(pm.Chat)
 	chatName := a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
-	if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
-		return err
+	if pm.Chat != types.StatusBroadcastJID {
+		if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
+			return err
+		}
 	}
 
 	// Best-effort: store contact info for DMs.
 	if pm.Chat.Server == types.DefaultUserServer {
-		if info, err := a.wa.GetContact(ctx, pm.Chat.ToNonAD()); err == nil {
+		chat := canonicalJID(pm.Chat)
+		if info, err := a.wa.GetContact(ctx, chat); err == nil {
 			_ = a.db.UpsertContact(
-				pm.Chat.String(),
-				pm.Chat.User,
+				chat.String(),
+				chat.User,
 				info.PushName,
 				info.FullName,
 				info.FirstName,
@@ -250,15 +428,18 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	} else if s := strings.TrimSpace(pm.PushName); s != "" && s != "-" {
 		senderName = s
 	}
+	senderJID := pm.SenderJID
 	if pm.SenderJID != "" {
 		if jid, err := types.ParseJID(pm.SenderJID); err == nil {
-			if info, err := a.wa.GetContact(ctx, jid.ToNonAD()); err == nil {
+			contactJID := a.canonicalStoreJID(ctx, jid)
+			senderJID = contactJID.String()
+			if info, err := a.wa.GetContact(ctx, contactJID); err == nil {
 				if name := wa.BestContactName(info); name != "" {
 					senderName = name
 				}
 				_ = a.db.UpsertContact(
-					jid.String(),
-					jid.User,
+					contactJID.String(),
+					contactJID.User,
 					info.PushName,
 					info.FullName,
 					info.FirstName,
@@ -271,7 +452,8 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	// Best-effort: store group metadata (and participants) when available.
 	if pm.Chat.Server == types.GroupServer {
 		if gi, err := a.wa.GetGroupInfo(ctx, pm.Chat); err == nil && gi != nil {
-			_ = a.db.UpsertGroup(gi.JID.String(), gi.GroupName.Name, gi.OwnerJID.String(), gi.GroupCreated)
+			ownerJID := a.canonicalStoreJID(ctx, gi.OwnerJID).String()
+			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, ownerJID, gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
 			var ps []store.GroupParticipant
 			for _, p := range gi.Participants {
 				role := "member"
@@ -282,7 +464,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 				}
 				ps = append(ps, store.GroupParticipant{
 					GroupJID: pm.Chat.String(),
-					UserJID:  p.JID.String(),
+					UserJID:  a.canonicalStoreJID(ctx, p.JID).String(),
 					Role:     role,
 				})
 			}
@@ -305,28 +487,194 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		fileLen = pm.Media.FileLength
 	}
 
-	displayText := a.buildDisplayText(ctx, pm)
+	if pm.Chat == types.StatusBroadcastJID {
+		return a.db.UpsertStatusMessage(store.UpsertStatusMessageParams{
+			MsgID:         pm.ID,
+			Timestamp:     pm.Timestamp,
+			FromMe:        pm.FromMe,
+			SenderJID:     senderJID,
+			SenderName:    senderName,
+			Text:          pm.Text,
+			MediaType:     mediaType,
+			MediaCaption:  caption,
+			Filename:      filename,
+			MimeType:      mimeType,
+			DirectPath:    directPath,
+			MediaKey:      mediaKey,
+			FileSHA256:    fileSha,
+			FileEncSHA256: fileEncSha,
+			FileLength:    fileLen,
+		})
+	}
 
-	return a.db.UpsertMessage(store.UpsertMessageParams{
-		ChatJID:       chatJID,
-		ChatName:      chatName,
-		MsgID:         pm.ID,
-		SenderJID:     pm.SenderJID,
-		SenderName:    senderName,
-		Timestamp:     pm.Timestamp,
-		FromMe:        pm.FromMe,
-		Text:          pm.Text,
-		DisplayText:   displayText,
-		MediaType:     mediaType,
-		MediaCaption:  caption,
-		Filename:      filename,
-		MimeType:      mimeType,
-		DirectPath:    directPath,
-		MediaKey:      mediaKey,
-		FileSHA256:    fileSha,
-		FileEncSHA256: fileEncSha,
-		FileLength:    fileLen,
+	displayText := a.buildDisplayText(ctx, pm)
+	if pm.Revoked {
+		displayText = store.DeletedMessageDisplayText
+	}
+
+	if err := a.db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID:         chatJID,
+		ChatName:        chatName,
+		MsgID:           pm.ID,
+		SenderJID:       senderJID,
+		SenderName:      senderName,
+		Timestamp:       pm.Timestamp,
+		FromMe:          pm.FromMe,
+		Text:            pm.Text,
+		DisplayText:     displayText,
+		QuotedMsgID:     pm.ReplyToID,
+		QuotedSenderJID: a.canonicalStoreJIDString(ctx, pm.ReplyToSenderJID),
+		Buttons:         waButtonsToStore(pm.Buttons),
+		IsForwarded:     pm.IsForwarded,
+		ForwardingScore: pm.ForwardingScore,
+		ReactionToID:    pm.ReactionToID,
+		ReactionEmoji:   pm.ReactionEmoji,
+		MediaType:       mediaType,
+		MediaCaption:    caption,
+		Filename:        filename,
+		MimeType:        mimeType,
+		DirectPath:      directPath,
+		MediaKey:        mediaKey,
+		FileSHA256:      fileSha,
+		FileEncSHA256:   fileEncSha,
+		FileLength:      fileLen,
+		Edited:          pm.Edited,
+		Revoked:         pm.Revoked,
+	}); err != nil {
+		return err
+	}
+	a.warnUnhandledPayload(pm)
+	if pm.Location != nil {
+		if err := a.db.UpsertMessageLocation(store.MessageLocation{
+			ChatJID:   chatJID,
+			MsgID:     pm.ID,
+			Latitude:  pm.Location.Latitude,
+			Longitude: pm.Location.Longitude,
+			Name:      pm.Location.Name,
+			Address:   pm.Location.Address,
+			IsLive:    pm.Location.IsLive,
+		}); err != nil {
+			return err
+		}
+	}
+	if pm.Call != nil {
+		pm.Call.Chat = pm.Chat
+		if pm.Call.SenderJID == "" {
+			pm.Call.SenderJID = senderJID
+		}
+		if pm.Call.Timestamp.IsZero() {
+			pm.Call.Timestamp = pm.Timestamp
+		}
+		if err := a.storeParsedCallEvent(ctx, *pm.Call, chatName, senderName); err != nil {
+			return err
+		}
+	}
+	if pm.StarredKnown {
+		return a.db.SetStarred(store.SetStarredParams{
+			ChatJID:   chatJID,
+			MsgID:     pm.ID,
+			SenderJID: senderJID,
+			FromMe:    pm.FromMe,
+			Starred:   pm.Starred,
+			StarredAt: pm.Timestamp,
+		})
+	}
+	return nil
+}
+
+func (a *App) storeParsedCallEvent(ctx context.Context, call wa.ParsedCallEvent, chatName, senderName string) error {
+	call.Chat = a.canonicalStoreJID(ctx, call.Chat)
+	chatJID := canonicalJIDString(call.Chat)
+	if chatJID == "" {
+		return fmt.Errorf("call chat JID is required")
+	}
+	if chatName == "" {
+		chatName = a.wa.ResolveChatName(ctx, call.Chat, "")
+	}
+	if err := a.db.UpsertChat(chatJID, chatKind(call.Chat), chatName, call.Timestamp); err != nil {
+		return err
+	}
+
+	senderJID := strings.TrimSpace(call.SenderJID)
+	if senderJID != "" {
+		if jid, err := types.ParseJID(senderJID); err == nil {
+			contactJID := a.canonicalStoreJID(ctx, jid)
+			senderJID = contactJID.String()
+			if senderName == "" {
+				if info, err := a.wa.GetContact(ctx, contactJID); err == nil {
+					senderName = wa.BestContactName(info)
+				}
+			}
+		}
+	}
+
+	participants := make([]store.CallParticipant, 0, len(call.Participants))
+	for _, p := range call.Participants {
+		jid := strings.TrimSpace(p.JID)
+		if jid != "" {
+			if parsed, err := types.ParseJID(jid); err == nil {
+				jid = canonicalJIDString(a.canonicalStoreJID(ctx, parsed))
+			}
+		}
+		if jid == "" {
+			continue
+		}
+		participants = append(participants, store.CallParticipant{
+			JID:     jid,
+			Outcome: p.Outcome,
+		})
+	}
+
+	return a.db.UpsertCallEvent(store.UpsertCallEventParams{
+		ChatJID:      chatJID,
+		ChatName:     chatName,
+		SenderJID:    senderJID,
+		SenderName:   senderName,
+		CallID:       call.CallID,
+		MsgID:        call.MsgID,
+		EventType:    call.EventType,
+		Direction:    call.Direction,
+		Media:        call.Media,
+		Outcome:      call.Outcome,
+		Reason:       call.Reason,
+		CallType:     call.CallType,
+		DurationSecs: call.DurationSecs,
+		Timestamp:    call.Timestamp,
+		Participants: participants,
 	})
+}
+
+func (a *App) deleteParsedCallEvents(ctx context.Context, deleted wa.ParsedCallDelete) error {
+	chat := a.canonicalStoreJID(ctx, deleted.Chat)
+	chatJID := canonicalJIDString(chat)
+	if chatJID == "" {
+		return fmt.Errorf("call chat JID is required")
+	}
+	_, err := a.db.DeleteCallEvents(store.DeleteCallEventsParams{
+		ChatJID:   chatJID,
+		Direction: deleted.Direction,
+	})
+	return err
+}
+
+func waButtonsToStore(buttons []wa.Button) []store.Button {
+	if len(buttons) == 0 {
+		return nil
+	}
+	out := make([]store.Button, len(buttons))
+	for i, b := range buttons {
+		out[i] = store.Button{
+			Type:         b.Type,
+			DisplayText:  b.DisplayText,
+			ID:           b.ID,
+			URL:          b.URL,
+			PhoneNumber:  b.PhoneNumber,
+			Description:  b.Description,
+			ResponseType: b.ResponseType,
+			Index:        b.Index,
+		}
+	}
+	return out
 }
 
 func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string {
@@ -368,7 +716,36 @@ func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string 
 	return base
 }
 
+// warnUnhandledPayload surfaces messages whose payload produced no content, so
+// the resulting "(message)" placeholder is diagnosable. Without it the row is
+// indistinguishable from a message that genuinely carried nothing, and any
+// consumer reading local history silently sees a gap it cannot account for.
+//
+// Called only after the message upsert succeeds: the warning states that the
+// row was stored, so emitting it earlier would report a write that may still
+// fail.
+func (a *App) warnUnhandledPayload(pm wa.ParsedMessage) {
+	if pm.UnhandledPayload == "" {
+		return
+	}
+	a.emitWarning(
+		"unhandled_message_payload",
+		fmt.Sprintf(
+			"stored message %s in %s without content: unhandled payload %s",
+			pm.ID, canonicalJIDString(pm.Chat), pm.UnhandledPayload,
+		),
+		map[string]any{
+			"chat_jid": canonicalJIDString(pm.Chat),
+			"msg_id":   pm.ID,
+			"payload":  pm.UnhandledPayload,
+		},
+	)
+}
+
 func baseDisplayText(pm wa.ParsedMessage) string {
+	if pm.Call != nil {
+		return callDisplayText(*pm.Call)
+	}
 	if pm.Media != nil {
 		return "Sent " + mediaLabel(pm.Media.Type)
 	}
@@ -376,6 +753,38 @@ func baseDisplayText(pm wa.ParsedMessage) string {
 		return text
 	}
 	return ""
+}
+
+func callDisplayText(call wa.ParsedCallEvent) string {
+	parts := []string{"WhatsApp"}
+	if call.Media != "" {
+		parts = append(parts, call.Media)
+	}
+	parts = append(parts, "call")
+	if call.Outcome != "" {
+		parts = append(parts, call.Outcome)
+	} else if call.EventType != "" && call.EventType != "call_log" {
+		parts = append(parts, call.EventType)
+	}
+	if call.DurationSecs > 0 {
+		parts = append(parts, fmt.Sprintf("(%s)", formatCallDuration(call.DurationSecs)))
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatCallDuration(seconds int64) string {
+	if seconds <= 0 {
+		return ""
+	}
+	minutes := seconds / 60
+	secs := seconds % 60
+	if minutes <= 0 {
+		return fmt.Sprintf("%ds", secs)
+	}
+	if secs == 0 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	return fmt.Sprintf("%dm%02ds", minutes, secs)
 }
 
 func (a *App) lookupMessageDisplayText(chatJID, msgID string) string {
@@ -415,6 +824,8 @@ func mediaLabel(mediaType string) string {
 		return "document"
 	case "location":
 		return "location"
+	case "live_location":
+		return "live location"
 	case "contact":
 		return "contact"
 	case "contacts":

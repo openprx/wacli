@@ -7,17 +7,107 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/steipete/wacli/internal/pathutil"
-	"github.com/steipete/wacli/internal/store"
+	"github.com/openclaw/wacli/internal/fsutil"
+	"github.com/openclaw/wacli/internal/pathutil"
+	"github.com/openclaw/wacli/internal/store"
 )
 
 type mediaJob struct {
 	chatJID string
 	msgID   string
+}
+
+type mediaQueue struct {
+	jobs      chan mediaJob
+	mu        sync.Mutex
+	pending   int
+	producers int
+	accepting bool
+	changed   chan struct{}
+}
+
+func newMediaQueue(buffer int) *mediaQueue {
+	return &mediaQueue{
+		jobs:      make(chan mediaJob, buffer),
+		accepting: true,
+		changed:   make(chan struct{}, 1),
+	}
+}
+
+func (q *mediaQueue) beginProducer() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.accepting {
+		return false
+	}
+	q.producers++
+	q.notify()
+	return true
+}
+
+func (q *mediaQueue) endProducer() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.producers--
+	if q.producers < 0 {
+		panic("media queue producer count became negative")
+	}
+	q.notify()
+}
+
+func (q *mediaQueue) enqueue(ctx context.Context, job mediaJob) {
+	q.mu.Lock()
+	q.pending++
+	q.mu.Unlock()
+	q.notify()
+	select {
+	case q.jobs <- job:
+	case <-ctx.Done():
+		q.done()
+	}
+}
+
+func (q *mediaQueue) done() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pending--
+	if q.pending < 0 {
+		panic("media queue pending count became negative")
+	}
+	q.notify()
+}
+
+func (q *mediaQueue) notify() {
+	select {
+	case q.changed <- struct{}{}:
+	default:
+	}
+}
+
+// waitIdle keeps media intake open while waiting, then atomically fences new
+// event producers once no callback or media job remains. This avoids a long
+// intake blackout during slow downloads without racing an in-flight handler.
+func (q *mediaQueue) waitIdle(ctx context.Context) bool {
+	for {
+		q.mu.Lock()
+		idle := q.pending == 0 && q.producers == 0
+		if idle {
+			q.accepting = false
+		}
+		q.mu.Unlock()
+		if idle {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-q.changed:
+		}
+	}
 }
 
 func (a *App) ResolveMediaOutputPath(info store.MediaDownloadInfo, requested string) (string, error) {
@@ -73,15 +163,15 @@ func mediaFilename(info store.MediaDownloadInfo) string {
 	return name
 }
 
-func (a *App) runMediaWorkers(ctx context.Context, jobs <-chan mediaJob, workers int) (func(), error) {
+func (a *App) runMediaWorkers(ctx context.Context, queue *mediaQueue, workers int) (wait func(), cancel func(), err error) {
 	if workers <= 0 {
 		workers = 2
 	}
-	if jobs == nil {
-		return func() {}, nil
+	if queue == nil {
+		return func() {}, func() {}, nil
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancelWorkers := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -91,52 +181,79 @@ func (a *App) runMediaWorkers(ctx context.Context, jobs <-chan mediaJob, workers
 				select {
 				case <-ctx.Done():
 					return
-				case job := <-jobs:
-					if strings.TrimSpace(job.chatJID) == "" || strings.TrimSpace(job.msgID) == "" {
-						continue
-					}
-					if err := a.downloadMediaJob(ctx, job); err != nil {
-						fmt.Fprintf(os.Stderr, "media download failed for %s/%s: %v\n", job.chatJID, job.msgID, err)
-					}
+				case job := <-queue.jobs:
+					// Recover per job so a panic fails one download
+					// instead of killing the worker permanently (#52).
+					func() {
+						defer queue.done()
+						defer func() {
+							if r := recover(); r != nil {
+								if a.eventsEnabled() {
+									a.emitEvent("media_worker_panic", map[string]any{
+										"chat_jid": job.chatJID,
+										"msg_id":   job.msgID,
+										"panic":    fmt.Sprint(r),
+										"stack":    string(debug.Stack()),
+									})
+								} else {
+									fmt.Fprintf(os.Stderr, "media worker panic (recovered) for %s/%s: %v\n%s\n",
+										job.chatJID, job.msgID, r, debug.Stack())
+								}
+							}
+						}()
+						if strings.TrimSpace(job.chatJID) == "" || strings.TrimSpace(job.msgID) == "" {
+							return
+						}
+						if _, err := a.downloadMediaJob(ctx, job); err != nil {
+							a.emitWarning(
+								"media_download_failed",
+								fmt.Sprintf("media download failed for %s/%s: %v", job.chatJID, job.msgID, err),
+								map[string]any{"chat_jid": job.chatJID, "msg_id": job.msgID, "error": err.Error()},
+							)
+						}
+					}()
 				}
 			}
 		}()
 	}
 
-	stop := func() {
-		cancel()
-		wg.Wait()
-	}
-	return stop, nil
+	return wg.Wait, cancelWorkers, nil
 }
 
-func (a *App) downloadMediaJob(ctx context.Context, job mediaJob) error {
+// downloadMediaJob fetches the media for a single message to disk and records
+// the local path. It returns downloaded=true only when a file was actually
+// fetched; a job that is already downloaded or lacks the metadata needed to
+// download is skipped with downloaded=false and a nil error.
+func (a *App) downloadMediaJob(ctx context.Context, job mediaJob) (downloaded bool, err error) {
 	info, err := a.db.GetMediaDownloadInfo(job.chatJID, job.msgID)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	if strings.TrimSpace(info.LocalPath) != "" {
-		return nil
+		return false, nil
 	}
 	if strings.TrimSpace(info.MediaType) == "" || strings.TrimSpace(info.DirectPath) == "" || len(info.MediaKey) == 0 {
-		return nil
+		return false, nil
 	}
 
 	targetPath, err := a.ResolveMediaOutputPath(info, "")
 	if err != nil {
-		return err
+		return false, err
 	}
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-		return err
+	if err := fsutil.EnsurePrivateDir(filepath.Dir(targetPath)); err != nil {
+		return false, err
 	}
 
 	if _, err := a.wa.DownloadMediaToFile(ctx, info.DirectPath, info.FileEncSHA256, info.FileSHA256, info.MediaKey, info.FileLength, info.MediaType, "", targetPath); err != nil {
-		return err
+		return false, err
 	}
 
-	now := time.Now().UTC()
-	return a.db.MarkMediaDownloaded(info.ChatJID, info.MsgID, targetPath, now)
+	now := nowUTC()
+	if err := a.db.MarkMediaDownloaded(info.ChatJID, info.MsgID, targetPath, now); err != nil {
+		return false, err
+	}
+	return true, nil
 }
