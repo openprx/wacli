@@ -49,6 +49,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 	var ephemeral bool
 	var ephemeralDuration string
 	var messageEscapes bool
+	var allowSelfSend bool
 	postSendWait := postSendRetryReceiptWait
 
 	cmd := &cobra.Command{
@@ -94,6 +95,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 					Ephemeral:            ephemeralOpts.Enabled,
 					EphemeralDuration:    ephemeralOpts.Duration,
 					EphemeralDurationSet: ephemeralOpts.DurationSet,
+					AllowSelfSend:        allowSelfSend,
 					PostSendWaitMS:       durationMillis(postSendWait),
 				})
 				if delegated {
@@ -114,7 +116,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := validateTextRecipient(a.WA(), toJID); err != nil {
+			if err := validateTextRecipient(a.WA(), toJID, allowSelfSend); err != nil {
 				return err
 			}
 			mentionedJIDs, err := parseMentionedJIDs(mentions)
@@ -131,7 +133,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 
 			preview := fetchLinkPreview(ctx, message, noPreview)
 			msgID, err := runSendOperation(ctx, reconnectForSend(a), func(ctx context.Context) (types.MessageID, error) {
-				return sendTextMessage(ctx, a, toJID, message, replyTo, replyToSender, preview, mentionedJIDs, ephemeralOpts)
+				return sendTextMessage(ctx, a, toJID, message, replyTo, replyToSender, preview, mentionedJIDs, ephemeralOpts, allowSelfSend)
 			})
 			if err != nil {
 				return err
@@ -166,6 +168,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().BoolVar(&ephemeral, "ephemeral", false, "send with the disappearing-message timer for this chat")
 	cmd.Flags().StringVar(&ephemeralDuration, "ephemeral-duration", "", "disappearing-message timer override (for example 24h, 7d, 90d, 168h)")
 	cmd.Flags().BoolVar(&messageEscapes, "message-escapes", false, `interpret backslash escapes in --message (\n, \r, \t, \\, \")`)
+	cmd.Flags().BoolVar(&allowSelfSend, "allow-self-send", false, "experimentally allow sending text to the linked account itself")
 	cmd.Flags().DurationVar(&postSendWait, "post-send-wait", postSendRetryReceiptWait, "keep the connection alive after send so retry receipts can be handled (0 disables)")
 	return cmd
 }
@@ -240,12 +243,16 @@ const defaultEphemeralExpiration uint32 = 7 * 24 * 60 * 60
 
 var errSelfTextRecipient = errors.New("send text to the linked account itself is not supported: WhatsApp can acknowledge self-messages without delivering them; use the official Message Yourself chat")
 
-func sendTextMessage(ctx context.Context, a sendTextApp, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions) (types.MessageID, error) {
-	return sendTextMessageWithSender(ctx, a.WA(), a.DB(), to, text, replyTo, replyToSender, preview, mentionedJIDs, ephemeral)
+func sendTextMessage(ctx context.Context, a sendTextApp, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions, allowSelfSend bool) (types.MessageID, error) {
+	return sendTextMessageWithSenderOptions(ctx, a.WA(), a.DB(), to, text, replyTo, replyToSender, preview, mentionedJIDs, ephemeral, allowSelfSend)
 }
 
 func sendTextMessageWithSender(ctx context.Context, sender textMessageSender, db *store.DB, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions) (types.MessageID, error) {
-	if err := validateTextRecipient(sender, to); err != nil {
+	return sendTextMessageWithSenderOptions(ctx, sender, db, to, text, replyTo, replyToSender, preview, mentionedJIDs, ephemeral, false)
+}
+
+func sendTextMessageWithSenderOptions(ctx context.Context, sender textMessageSender, db *store.DB, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions, allowSelfSend bool) (types.MessageID, error) {
+	if err := validateTextRecipient(sender, to, allowSelfSend); err != nil {
 		return "", err
 	}
 	var aliasTo types.JID
@@ -280,8 +287,8 @@ func sendTextMessageWithSender(ctx context.Context, sender textMessageSender, db
 	return sender.SendProtoMessage(ctx, to, msg)
 }
 
-func validateTextRecipient(sender textMessageSender, to types.JID) error {
-	if isSelfTextRecipient(sender, to) {
+func validateTextRecipient(sender textMessageSender, to types.JID, allowSelfSend bool) error {
+	if !allowSelfSend && isSelfTextRecipient(sender, to) {
 		return errSelfTextRecipient
 	}
 	return nil

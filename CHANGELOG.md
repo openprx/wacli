@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.17.2-openprx.1 - 2026-08-31
+
+### Added
+
+- Send: add an explicit `send text --allow-self-send` escape hatch for Message
+  Yourself integrations while preserving the safe default rejection.
+
 ### Fixed
 
 - CLI: keep successful JSON commands successful when a pipe reader closes early, including Unix stdout SIGPIPE and Windows closed-pipe errors. (#366 - thanks @SebTardif)
